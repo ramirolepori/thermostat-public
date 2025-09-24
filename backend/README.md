@@ -1,13 +1,12 @@
 # Backend Thermostat - Documentación Técnica
 
 ## Descripción
-Este backend controla un termostato inteligente basado en Node.js, Express y TypeScript. Gestiona la lectura de sensores, el control de relé, la lógica de histéresis y la persistencia de escenas en MongoDB.
+Este backend controla un termostato inteligente basado en Node.js, Express y TypeScript. Gestiona la lectura de sensores, el control de relé y la lógica de histéresis.
 
 ## Estructura principal
 - **src/services/logic.ts**: Lógica principal del termostato (control, validaciones, errores).
 - **src/routes/routes.ts**: Endpoints REST para frontend y API.
 - **src/hardware/**: Acceso a hardware (sensor de temperatura y relé GPIO).
-- **src/database/**: Modelos y conexión a MongoDB.
 - **ecosystem.config.js**: Configuración de PM2 para producción.
 
 ## Instalación y ejecución
@@ -19,7 +18,7 @@ Este backend controla un termostato inteligente basado en Node.js, Express y Typ
    ```bash
    npm run build
    ```
-3. Configura las variables de entorno en `.env` (ejemplo: `MONGODB_URI`).
+3. Configura las variables de entorno en `.env`.
 4. Inicia con PM2:
    ```bash
    pm2 start ecosystem.config.js
@@ -32,7 +31,6 @@ Este backend controla un termostato inteligente basado en Node.js, Express y Typ
 - `POST /api/target-temperature` — Cambia la temperatura objetivo.
 - `POST /api/hysteresis` — Cambia la histéresis.
 - `POST /api/thermostat/start|stop|reset` — Controla el ciclo de vida.
-- `GET/POST/DELETE /api/scenes` — Gestión de escenas.
 
 ## Buenas prácticas implementadas
 - Validación centralizada de parámetros.

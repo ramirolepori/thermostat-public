@@ -1,6 +1,5 @@
 import { getTemperature } from "../hardware/sensor";
 import { turnOnRelay, turnOffRelay, getRelayState, toggleRelay } from "../hardware/relay";
-import { SettingModel } from "../database/settings.model"; // Importar el modelo de configuración
 import { publishSetpointUpdate, publishModeUpdate } from "./mqtt"; // Importar función MQTT para publicar actualizaciones
 
 // Configuración del termostato
@@ -169,7 +168,7 @@ export function stopThermostat(): boolean {
 /**
  * Actualiza la temperatura objetivo
  */
-export async function setTargetTemperature(temperature: number): Promise<boolean> {
+export function setTargetTemperature(temperature: number): boolean {
   try {
     if (!validateTemperatureValue(temperature)) {
       throw new Error(`Temperatura fuera de rango válido: ${temperature}°C (debe estar entre 5-30°C)`);
@@ -177,13 +176,6 @@ export async function setTargetTemperature(temperature: number): Promise<boolean
     thermostatConfig.targetTemperature = temperature;
     thermostatState.targetTemperature = temperature;
     console.log(`Temperatura objetivo actualizada a: ${temperature}°C`);
-
-    const updatedAt = new Date();
-    await SettingModel.updateOne(
-      { key: "targetTemperature" },
-      { $set: { value: temperature, updatedAt } },
-      { upsert: true }
-    );
 
     if (thermostatState.isRunning) {
       updateCurrentState();
@@ -210,20 +202,8 @@ export async function setTargetTemperature(temperature: number): Promise<boolean
 /**
  * Devuelve la temperatura objetivo obtenida desde la base de datos
  */
-export async function getTargetTemperature(): Promise<number> {
-  try {
-    const dbRecord = await SettingModel.findOne({ key: "targetTemperature" }).lean();
-    if (dbRecord && dbRecord.value) {
-      console.log(`Temperatura objetivo obtenida de la base de datos: ${dbRecord.value}°C`);
-      return dbRecord.value;
-    } else {
-      console.warn("No se encontró un valor válido en la base de datos, usando configuración actual.");
-      return thermostatConfig.targetTemperature;
-    }
-  } catch (error) {
-    console.error("Error al obtener la temperatura de la base de datos:", error);
-    return thermostatConfig.targetTemperature;
-  }
+export function getTargetTemperature(): number {
+  return thermostatConfig.targetTemperature;
 }
 
 /**
@@ -424,26 +404,3 @@ export function validateHysteresisValue(hysteresis: number): boolean {
   return typeof hysteresis === 'number' && !isNaN(hysteresis) && hysteresis > 0 && hysteresis <= 5;
 }
 
-/**
- * Obtiene la temperatura objetivo y la histéresis desde la base de datos
- */
-export async function getTargetTemperatureAndHysteresis(): Promise<{ targetTemperature: number; hysteresis: number }> {
-  try {
-    const dbRecord = await SettingModel.findOne({ key: "targetTemperature" }).lean();
-    const targetTemperature = dbRecord?.value || DEFAULT_CONFIG.targetTemperature;
-    const hysteresis = dbRecord?.hysteresis || DEFAULT_CONFIG.hysteresis;
-
-    console.log(`Configuración obtenida de la base de datos: targetTemperature=${targetTemperature}°C, hysteresis=${hysteresis}°C`);
-    return { targetTemperature, hysteresis };
-  } catch (error) {
-    console.error("Error al obtener configuración de la base de datos:", error);
-    return { targetTemperature: DEFAULT_CONFIG.targetTemperature, hysteresis: DEFAULT_CONFIG.hysteresis };
-  }
-}
-
-// Actualizo el estado inicial del termostato usando la configuración de la base de datos
-(async () => {
-  const config = await getTargetTemperatureAndHysteresis();
-  thermostatState.targetTemperature = config.targetTemperature;
-  thermostatState.hysteresis = config.hysteresis;
-})();

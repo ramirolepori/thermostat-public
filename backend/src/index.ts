@@ -9,7 +9,6 @@ import routes from './routes/routes';
 import { startThermostat } from './services/logic';
 import { initializeMqtt, stopMqtt } from './services/mqtt';
 import { cpus, networkInterfaces } from 'os';
-import mongoose from 'mongoose';
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
@@ -102,9 +101,6 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
     error: isProd ? 'Error interno del servidor' : err.message
   });
 });
-
-// Habilitar logs de depuración de Mongoose
-mongoose.set('debug', true);
 
 // Iniciar el servidor solo en localhost
 app.listen(PORT, HOST, () => {
