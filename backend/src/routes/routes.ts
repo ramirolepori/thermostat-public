@@ -18,9 +18,6 @@ import {
   restartMqtt, 
   isMqttHealthy 
 } from '../services/mqtt';
-import { SceneModel } from '../database/scene.model';
-import { SettingModel } from '../database/settings.model';
-import { Types } from 'mongoose';
 
 const router = Router();
 
@@ -185,9 +182,9 @@ router.get('/status', (req: Request, res: Response) => {
 });
 
 // Obtener temperatura objetivo
-router.get('/target-temperature', async (_req: Request, res: Response) => {
+router.get('/target-temperature', (_req: Request, res: Response) => {
   try {
-    const targetTemperature = await getTargetTemperature();
+    const targetTemperature = getTargetTemperature();
     res.set('Cache-Control', 'private, max-age=5');
     res.status(200).json({ target: targetTemperature });
   } catch (error) {
@@ -209,12 +206,12 @@ router.get('/hysteresis', (_req: Request, res: Response) => {
 });
 
 // Establecer temperatura objetivo usando middleware de validación
-router.post('/target-temperature', validateTemperature, async (req: TemperatureRequest, res: Response) => {
+router.post('/target-temperature', validateTemperature, (req: TemperatureRequest, res: Response) => {
   try {
     const { temperature } = req.body;
 
     // Ya validado por el middleware
-    const success = await setTargetTemperature(temperature!);
+    const success = setTargetTemperature(temperature!);
 
     if (!success) {
       const lastError = getLastError();
@@ -227,13 +224,7 @@ router.post('/target-temperature', validateTemperature, async (req: TemperatureR
     temperatureCache.timestamp = 0;
     lastStateETag = '';
 
-    // Verificar actualización en la base de datos
-    const dbRecord = await SettingModel.findOne({ key: "targetTemperature" }).lean();
-    if (!dbRecord || dbRecord.value !== temperature) {
-      return res.status(500).json({ error: 'Error al actualizar la base de datos' });
-    }
-
-    res.status(200).json({ targetTemperature: dbRecord.value });
+    res.status(200).json({ targetTemperature: temperature });
   } catch (error) {
     console.error('Error en endpoint /target-temperature:', error);
     res.status(500).json({ error: 'Error interno al establecer la temperatura objetivo' });
@@ -370,51 +361,6 @@ router.post('/thermostat/reset', (_req: Request, res: Response) => {
   }
 });
 
-// Obtener todas las escenas
-router.get('/scenes', async (_req, res) => {
-  try {
-    const scenes = await SceneModel.find();
-    res.json(scenes);
-  } catch (error) {
-    res.status(500).json({ error: 'Error al obtener escenas' });
-  }
-});
-
-// Crear una nueva escena
-router.post('/scenes', async (req, res) => {
-  try {
-    const { name, temperature, active } = req.body;
-    if (!name || typeof temperature !== 'number') {
-      return res.status(400).json({ error: 'Nombre y temperatura son requeridos' });
-    }
-    const scene = new SceneModel({ name, temperature, active: !!active });
-    await scene.save();
-    res.status(201).json(scene);
-  } catch (error) {
-    // Corregido: asegurar que error es any para acceder a error.code
-    if ((error as any).code === 11000) {
-      return res.status(409).json({ error: 'Ya existe una escena con ese nombre' });
-    }
-    res.status(500).json({ error: 'Error al crear la escena' });
-  }
-});
-
-// Eliminar una escena por ID
-router.delete('/scenes/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ error: 'ID inválido' });
-    }
-    const result = await SceneModel.findByIdAndDelete(id);
-    if (!result) {
-      return res.status(404).json({ error: 'Escena no encontrada' });
-    }
-    res.json({ message: 'Escena eliminada' });
-  } catch (error) {
-    res.status(500).json({ error: 'Error al eliminar la escena' });
-  }
-});
 
 // === Rutas para gestión MQTT ===
 

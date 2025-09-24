@@ -9,7 +9,6 @@ Un termostato inteligente modular con integración completa para Home Assistant,
 - 🔄 **Control automático y manual** del sistema de calefacción
 - 📱 **Interfaz web responsive** desarrollada en React
 - ⚡ **Backend escalable** con Node.js y TypeScript
-- 🗄️ **Persistencia de datos** con MongoDB
 - 🔌 **Control de hardware** para Raspberry Pi (GPIO)
 - 🖥️ **Modo desarrollo** con hardware simulado
 - 📊 **Escenas programables** para automatización avanzada
@@ -33,12 +32,6 @@ Un termostato inteligente modular con integración completa para Home Assistant,
                                         │
                                         ▼
                                ┌──────────────────┐
-                               │    MongoDB       │
-                               │   (Database)     │
-                               └──────────────────┘
-                                        │
-                                        ▼
-                               ┌──────────────────┐
                                │  Raspberry Pi    │
                                │   Hardware       │
                                │ (GPIO/Sensors)   │
@@ -50,7 +43,6 @@ Un termostato inteligente modular con integración completa para Home Assistant,
 ### Prerrequisitos
 
 - **Node.js** 18+ y npm
-- **MongoDB** (local o MongoDB Atlas)
 - **MQTT Broker** (Mosquitto recomendado)
 - **Raspberry Pi** (para control de hardware real)
 
@@ -79,11 +71,7 @@ cd ../frontend
 npm install
 ```
 
-### 4. Configurar Base de Datos
-
-Crear una base de datos MongoDB y actualizar `MONGODB_URI` en el archivo `.env`.
-
-### 5. Configurar MQTT
+### 4. Configurar MQTT
 
 Instalar y configurar Mosquitto:
 
@@ -103,9 +91,6 @@ sudo systemctl start mosquitto
 ### Variables de Entorno (Backend)
 
 ```env
-# Base de datos
-MONGODB_URI=mongodb://localhost:27017/thermostat
-
 # Servidor
 PORT=3001
 NODE_ENV=development
@@ -245,7 +230,6 @@ Content-Type: application/json
 ```
 ├── backend/                 # Servidor Node.js
 │   ├── src/
-│   │   ├── database/       # Modelos de MongoDB
 │   │   ├── hardware/       # Control GPIO/Sensores
 │   │   ├── routes/         # Rutas API REST
 │   │   └── services/       # Lógica MQTT y termostato
@@ -292,7 +276,6 @@ El sistema detecta automáticamente si se ejecuta en Raspberry Pi o en un entorn
 - **Rango de operación**: -10°C a 85°C
 - **Frecuencia de muestreo**: 5 segundos (configurable)
 - **Latencia MQTT**: <100ms
-- **Persistencia**: MongoDB con TTL automático
 
 ## 🐛 Solución de Problemas
 
