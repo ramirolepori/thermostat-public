@@ -1,326 +1,75 @@
-# 🌡️ Smart Thermostat MVP
+# Termostato inteligente para Raspberry Pi
 
-Un termostato inteligente modular con integración completa para Home Assistant, desarrollado con TypeScript, React y MQTT.
+Backend de un termostato casero que maneja una caldera por relé. Sensa la temperatura, decide cuándo prender con control **TPI** (Time Proportional & Integral) y se integra con **HomeKit** a través de Home Assistant y Homebridge, por **MQTT**.
 
-## 📋 Características
+Lo empecé como proyecto personal en abril de 2025 con un on/off simple. En junio de 2026 lo pasé a TPI. El proyecto sigue vivo: lo uso todos los días en mi casa.
 
-- 🏠 **Integración nativa con Home Assistant** via MQTT
-- 🌡️ **Control de temperatura preciso** con sensor DS18B20
-- 🔄 **Control automático y manual** del sistema de calefacción
-- 📱 **Interfaz web responsive** desarrollada en React
-- ⚡ **Backend escalable** con Node.js y TypeScript
-- 🔌 **Control de hardware** para Raspberry Pi (GPIO)
-- 🖥️ **Modo desarrollo** con hardware simulado
-- 📊 **Escenas programables** para automatización avanzada
-- 🔄 **Actualizaciones en tiempo real** entre todos los componentes
+## Cómo decide la caldera
 
-## 🏗️ Arquitectura
+El control corre cada 3 segundos y mira el error `e = setpoint - temperatura`.
 
-```
-┌─────────────────┐    MQTT    ┌──────────────────┐
-│  Home Assistant │ ◄────────► │  MQTT Broker     │
-└─────────────────┘            │  (Mosquitto)     │
-                               └──────────────────┘
-                                        ▲
-                                        │ MQTT
-                                        ▼
-┌─────────────────┐    HTTP    ┌──────────────────┐
-│   React Frontend│ ◄────────► │   Node.js        │
-│   (Port 5173)   │            │   Backend        │
-└─────────────────┘            │   (Port 3001)    │
-                               └──────────────────┘
-                                        │
-                                        ▼
-                               ┌──────────────────┐
-                               │  Raspberry Pi    │
-                               │   Hardware       │
-                               │ (GPIO/Sensors)   │
-                               └──────────────────┘
-```
+| Situación | Qué hace |
+| --- | --- |
+| `e` >= 1,5 °C (banda proporcional) | Caldera prendida todo el ciclo |
+| `e` entre 0 y 1,5 °C | Pulsa: prende `e / 1,5` del ciclo de 20 minutos, más un término integral |
+| Se llegó al objetivo | Apagada. No vuelve a prender hasta que la temperatura baja 0,5 °C (banda muerta) |
 
-## 🚀 Instalación Rápida
+Con un encendido mínimo de 2 minutos y un apagado mínimo de 3, para no maltratar la caldera. Los parámetros están en `backend/src/services/tpiController.ts`.
 
-### Prerrequisitos
+### Fail-safe
 
-- **Node.js** 18+ y npm
-- **MQTT Broker** (Mosquitto recomendado)
-- **Raspberry Pi** (para control de hardware real)
+El sensor (DS18B20) devuelve de vez en cuando una lectura con CRC inválido. Se descarta y se reintenta. Se descartan también el valor centinela de 85 °C y lecturas fuera de -10 a 80 °C. Si fallan 5 lecturas seguidas se apaga el relé, pero el termostato sigue reintentando y retoma el control solo cuando vuelve una lectura válida.
 
-### 1. Clonar el repositorio
+### Simulador térmico
 
-```bash
-git clone https://github.com/ramirolepori/thermostat-public.git
-cd thermostat-public
-```
-
-### 2. Configurar Backend
+Para cambiar el control sin tocar la caldera hay un simulador con un modelo simple de habitación:
 
 ```bash
 cd backend
-npm install
-
-# Copiar y configurar variables de entorno
-cp .env.example .env
-# Editar .env con tus configuraciones
+npm ci --ignore-scripts
+npx ts-node src/sim-tpi.ts
 ```
 
-### 3. Configurar Frontend
+Imprime la evolución de temperatura, duty, modo y ciclos por hora en varios escenarios. Es un modelo aproximado, sirve para detectar comportamientos raros, no para predecir la casa real.
+
+## Arquitectura
+
+```
+sensor DS18B20 + relé (GPIO)  <->  backend Node/TypeScript (TPI)  <->  MQTT (Mosquitto)  <->  Home Assistant / Homebridge  <->  HomeKit
+```
+
+- **Hardware:** Raspberry Pi 3 Model B, sensor DS18B20 por 1-Wire, relé activo-bajo en el GPIO 17 (con `pigpio`).
+- **Backend:** Node.js, TypeScript, Express, Helmet y el cliente `mqtt`. Se corre con PM2, con reinicio si pasa de 200 MB.
+- **API HTTP:** escucha solo en `127.0.0.1:3001`. Hacia afuera se comunica por MQTT.
+- **Estado:** el setpoint y el modo se guardan en un archivo JSON local (`THERMOSTAT_STATE_FILE`).
+
+### MQTT
+
+Broker `mqtt://localhost:1883` por defecto (`MQTT_BROKER_URL`). Payloads con la forma `{ "value": <v>, "timestamp": <ISO> }`.
+
+- Estado: `termostato/status/{online,temperature,relay,setpoint,mode}`
+- Comandos: `termostato/setpoint/set`, `termostato/mode/set`
+
+Más detalle en [backend/MQTT_README.md](backend/MQTT_README.md). Un ejemplo de configuración de Home Assistant está en `homeassistant_configuration_simple.yaml`.
+
+## Puesta en marcha
+
+Requiere Node 18+, un broker MQTT y, para el hardware real, una Raspberry Pi con `pigpio`.
 
 ```bash
-cd ../frontend
-npm install
-```
-
-### 4. Configurar MQTT
-
-Instalar y configurar Mosquitto:
-
-```bash
-# Ubuntu/Debian
-sudo apt-get install mosquitto mosquitto-clients
-
-# macOS
-brew install mosquitto
-
-# Iniciar el servicio
-sudo systemctl start mosquitto
-```
-
-## ⚙️ Configuración
-
-### Variables de Entorno (Backend)
-
-```env
-# Servidor
-PORT=3001
-NODE_ENV=development
-
-# MQTT
-MQTT_BROKER_URL=mqtt://localhost:1883
-MQTT_CLIENT_ID=termostato_backend
-
-# Hardware GPIO (Raspberry Pi)
-SENSOR_GPIO_PIN=4
-RELAY_GPIO_PIN=18
-```
-
-### Configuración de Home Assistant
-
-Agregar al archivo `configuration.yaml`:
-
-```yaml
-# MQTT Configuration
-mqtt:
-  climate:
-    - name: "Termostato Inteligente"
-      current_temperature_topic: "termostato/status/temperatura"
-      current_temperature_template: "{{ value_json.value }}"
-      temperature_command_topic: "termostato/control/setpoint"
-      temperature_state_topic: "termostato/status/setpoint"
-      temperature_state_template: "{{ value_json.value }}"
-      mode_command_topic: "termostato/control/enabled"
-      mode_state_topic: "termostato/status/enabled"
-      mode_state_template: >
-        {% if value_json.value == true %}heat{% else %}off{% endif %}
-      modes: ["heat", "off"]
-      availability_topic: "termostato/status/online"
-      payload_available: "true"
-      payload_not_available: "false"
-
-  sensor:
-    - name: "Temperatura Actual Termostato"
-      state_topic: "termostato/status/temperatura"
-      value_template: "{{ value_json.value }}"
-      unit_of_measurement: "°C"
-      device_class: "temperature"
-      availability_topic: "termostato/status/online"
-```
-
-## 🏃‍♂️ Ejecución
-
-### Desarrollo
-
-```bash
-# Terminal 1: Backend
 cd backend
-npm run dev
-
-# Terminal 2: Frontend
-cd frontend
-npm run dev
-
-# Terminal 3: MQTT (si es necesario)
-mosquitto -v
-```
-
-### Producción
-
-```bash
-# Construir frontend
-cd frontend
+npm ci
 npm run build
-
-# Construir y ejecutar backend
-cd ../backend
-npm run build
+cp .env.example .env   # opcional: PORT, MQTT_BROKER_URL, MQTT_CLIENT_ID, THERMOSTAT_STATE_FILE
 npm start
 ```
 
-## 🔧 Uso
+`pigpio` necesita acceso a GPIO y hoy el backend corre como root en la Pi. Es lo que más me gustaría mejorar.
 
-### Interfaz Web
+## Estado
 
-1. Abrir `http://localhost:5173` en el navegador
-2. Ajustar temperatura objetivo
-3. Activar/desactivar modo automático
-4. Configurar escenas de automatización
+Sin tests automáticos: la lógica de control se valida con el simulador y en la Pi real. No hay CI, el deploy es manual.
 
-### Home Assistant
+## Licencia
 
-1. El termostato aparecerá como `climate.termostato_inteligente`
-2. Controlar desde la interfaz de HA o automatizaciones
-3. Ver sensores adicionales en el panel de entidades
-
-### API REST
-
-```bash
-# Obtener estado actual
-GET http://localhost:3001/api/status
-
-# Establecer temperatura
-POST http://localhost:3001/api/setpoint
-Content-Type: application/json
-{"temperature": 22}
-
-# Activar/desactivar
-POST http://localhost:3001/api/enable
-Content-Type: application/json
-{"enabled": true}
-```
-
-## 📡 Protocolo MQTT
-
-### Topics de Estado (Solo lectura)
-
-- `termostato/status/temperatura` - Temperatura actual
-- `termostato/status/setpoint` - Temperatura objetivo
-- `termostato/status/enabled` - Estado activado/desactivado
-- `termostato/status/heating` - Estado del relé de calefacción
-- `termostato/status/online` - Estado de conectividad
-
-### Topics de Control (Escritura)
-
-- `termostato/control/setpoint` - Cambiar temperatura objetivo
-- `termostato/control/enabled` - Activar/desactivar termostato
-- `termostato/control/manual_relay` - Control manual del relé
-
-### Formato de Mensajes
-
-```json
-{
-  "value": <valor>,
-  "timestamp": "2024-01-01T12:00:00.000Z"
-}
-```
-
-## 🛠️ Desarrollo
-
-### Estructura del Proyecto
-
-```
-├── backend/                 # Servidor Node.js
-│   ├── src/
-│   │   ├── hardware/       # Control GPIO/Sensores
-│   │   ├── routes/         # Rutas API REST
-│   │   └── services/       # Lógica MQTT y termostato
-│   └── package.json
-├── frontend/               # Aplicación React
-│   ├── src/
-│   │   ├── components/     # Componentes UI
-│   │   ├── api/           # Cliente HTTP
-│   │   └── styles/        # Estilos CSS
-│   └── package.json
-├── scripts/               # Scripts de despliegue
-└── README.md
-```
-
-### Modo Desarrollo (Sin Hardware)
-
-El sistema detecta automáticamente si se ejecuta en Raspberry Pi o en un entorno de desarrollo:
-
-- **Raspberry Pi**: Usa GPIO real y sensor DS18B20
-- **Desarrollo**: Usa sensores simulados con valores realistas
-
-### Contribuir
-
-1. Fork el repositorio
-2. Crear una rama para la feature: `git checkout -b feature/nueva-feature`
-3. Commit los cambios: `git commit -am 'Add nueva feature'`
-4. Push a la rama: `git push origin feature/nueva-feature`
-5. Crear un Pull Request
-
-## 📊 Características Técnicas
-
-### Hardware Compatible
-
-- **Raspberry Pi** (todos los modelos con GPIO)
-- **Sensor de temperatura**: DS18B20 (1-Wire)
-- **Relé**: Compatible con GPIO (3.3V/5V)
-- **Conexiones**:
-  - DS18B20 → GPIO 4 (configurable)
-  - Relé → GPIO 18 (configurable)
-
-### Especificaciones
-
-- **Precisión de temperatura**: ±0.5°C
-- **Rango de operación**: -10°C a 85°C
-- **Frecuencia de muestreo**: 5 segundos (configurable)
-- **Latencia MQTT**: <100ms
-
-## 🐛 Solución de Problemas
-
-### Problemas Comunes
-
-**Backend no conecta a MQTT**
-```bash
-# Verificar que Mosquitto esté ejecutándose
-sudo systemctl status mosquitto
-
-# Probar conexión manual
-mosquitto_pub -h localhost -t test -m "hello"
-```
-
-**Sensor no detectado en Raspberry Pi**
-```bash
-# Verificar módulos 1-Wire
-sudo modprobe w1-gpio
-sudo modprobe w1-therm
-
-# Listar sensores detectados
-ls /sys/bus/w1/devices/
-```
-
-**Home Assistant no recibe datos**
-```bash
-# Verificar topics MQTT
-mosquitto_sub -h localhost -t "termostato/status/#"
-```
-
-## 📄 Licencia
-
-MIT License - ver [LICENSE](LICENSE) para más detalles.
-
-## 🙋‍♂️ Autor
-
-**Ramiro Lepori**
-- GitHub: [@ramirolepori](https://github.com/ramirolepori)
-
-## 🌟 Agradecimientos
-
-- [Home Assistant](https://www.home-assistant.io/) por la plataforma de domótica
-- [MQTT.org](https://mqtt.org/) por el protocolo de comunicación
-- Comunidad de Raspberry Pi por las librerías de hardware
-
----
-
-⭐ **¡Si este proyecto te resulta útil, considera darle una estrella!** ⭐
+MIT

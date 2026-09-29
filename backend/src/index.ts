@@ -2,11 +2,10 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import express from 'express';
-import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import routes from './routes/routes';
-import { startThermostat } from './services/logic';
+import { startThermostat, wasRunningPersisted, startTemperatureMonitor } from './services/logic';
 import { initializeMqtt, stopMqtt } from './services/mqtt';
 import { cpus, networkInterfaces } from 'os';
 
@@ -35,21 +34,15 @@ function getLocalIP(): string {
 }
 
 // Aplicar middleware de seguridad básica (solo en producción)
-if (isProd) {
-  app.use(helmet());
-}
+app.use(helmet());
 
 // Middleware para comprimir respuestas
 app.use(compression());
 
-// Configurar CORS con opciones más específicas
-app.use(cors({
-  origin: '*', // Permitir solicitudes desde cualquier origen
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-  maxAge: 86400 // Cachear preflight requests por 24 horas
-}));
+// Configurar CORS. La API solo escucha en localhost, así que CORS es marginal;
+// se deja permisivo pero SIN credentials (origin '*' + credentials:true es una
+// combinación inválida que los navegadores rechazan).
+// La API escucha solo en localhost y no tiene frontend: no se habilita CORS.
 
 // Parsear JSON con límite para evitar ataques de payload grandes
 app.use(express.json({ limit: '100kb' }));
@@ -106,12 +99,22 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 app.listen(PORT, HOST, () => {
   const localIP = getLocalIP();
   console.log(`✅ Backend corriendo en http://${HOST}:${PORT} (${isProd ? 'producción' : 'desarrollo'})`);
-  console.log(`✅ Backend accesible solo a través de Nginx en http://${localIP}/api`);
+  console.log(`ℹ️  API accesible solo desde localhost (IP del equipo: ${localIP}). La integración con HomeKit va por MQTT.`);
   console.log(`✅ Servidor optimizado para ${cpus().length} CPU(s)`);
   
-  // Iniciar el termostato con la configuración predeterminada
-  startThermostat();
-  console.log('✅ Termostato iniciado con configuración predeterminada');
+  // Iniciar el termostato solo si el último modo persistido no era OFF. Así un
+  // reinicio del proceso o un corte de luz respeta que el usuario lo dejó apagado
+  // (y, si estaba encendido, la calefacción se reanuda sola).
+  if (wasRunningPersisted()) {
+    startThermostat();
+    console.log('✅ Termostato iniciado (modo encendido)');
+  } else {
+    console.log('ℹ️  Termostato en OFF según el estado persistido: no se inicia automáticamente.');
+  }
+
+  // Monitor de temperatura para display: corre siempre (incluso en OFF) para que
+  // HomeKit/HA muestren la temperatura del ambiente.
+  startTemperatureMonitor();
 
   // Inicializar servicio MQTT después de un breve delay para que el termostato esté listo
   setTimeout(() => {

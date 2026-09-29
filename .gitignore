@@ -101,3 +101,5 @@ homeassistant_backup/
 
 # Microsoft Office temporary files
 ~$*
+# Estado en runtime del termostato
+data/
