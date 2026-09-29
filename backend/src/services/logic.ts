@@ -1,6 +1,9 @@
 import { getTemperature } from "../hardware/sensor";
-import { turnOnRelay, turnOffRelay, getRelayState, toggleRelay } from "../hardware/relay";
-import { publishSetpointUpdate, publishModeUpdate } from "./mqtt"; // Importar función MQTT para publicar actualizaciones
+import { turnOnRelay, turnOffRelay, getRelayState } from "../hardware/relay";
+import { publishModeUpdate } from "./mqtt"; // Importar función MQTT para publicar actualizaciones
+import { getFreshExternalSources } from "./temperatureSources"; // Fuentes externas de temperatura (HomePods)
+import { computeDesiredRelay, resetTPI, DEFAULT_TPI } from "./tpiController"; // Control TPI de la calefacción
+import { loadPersistedState, savePersistedState } from "./persistence"; // Persistencia del setpoint a disco
 
 // Configuración del termostato
 interface ThermostatConfig {
@@ -24,16 +27,24 @@ interface ThermostatState {
 
 // Valores predeterminados
 const DEFAULT_CONFIG: ThermostatConfig = {
-  targetTemperature: 22, // 22°C por defecto
+  targetTemperature: 20, // 20°C por defecto (solo en el primer arranque sin estado persistido)
   hysteresis: 1.5, // Diferencial de 1.5°C
   checkIntervalMs: 3000, // Revisar cada 3 segundos (mejora de performance)
-  maxConsecutiveErrors: 5, // Máximo de errores consecutivos antes de apagar el sistema
+  maxConsecutiveErrors: 5, // Máximo de errores consecutivos antes del fail-safe
 };
+
+// Cargar el último setpoint persistido (sobrevive a reinicios y cortes de luz).
+// Si no hay archivo o es inválido, se usa el default.
+const persisted = loadPersistedState();
+const initialTarget =
+  typeof persisted.targetTemperature === 'number' && validateTemperatureValue(persisted.targetTemperature)
+    ? persisted.targetTemperature
+    : DEFAULT_CONFIG.targetTemperature;
 
 // Estado inicial
 let thermostatState: ThermostatState = {
   currentTemperature: 0,
-  targetTemperature: DEFAULT_CONFIG.targetTemperature,
+  targetTemperature: initialTarget,
   hysteresis: DEFAULT_CONFIG.hysteresis,
   isHeating: false,
   lastUpdated: new Date(),
@@ -42,9 +53,30 @@ let thermostatState: ThermostatState = {
   consecutiveErrors: 0,
 };
 
-let thermostatConfig: ThermostatConfig = { ...DEFAULT_CONFIG };
+let thermostatConfig: ThermostatConfig = { ...DEFAULT_CONFIG, targetTemperature: initialTarget };
 let thermostatInterval: NodeJS.Timeout | null = null;
-let lastControlAction = Date.now(); // Rastrear la última vez que se tomó una acción de control
+let isUpdating = false; // Evita que dos ciclos de lectura se solapen si el sensor tarda
+let failSafeActive = false; // True mientras el fail-safe mantiene la caldera apagada por falta de sensor
+
+/**
+ * Guarda en disco el setpoint y el modo on/off actuales (fire-and-forget).
+ * Sobrevive a reinicios del proceso y cortes de luz.
+ */
+function persistState(): void {
+  void savePersistedState({
+    targetTemperature: thermostatConfig.targetTemperature,
+    isRunning: thermostatState.isRunning,
+  });
+}
+
+/**
+ * Indica si el termostato debe arrancar automáticamente al iniciar el proceso,
+ * según el último modo persistido. Si nunca se persistió (primer arranque) o
+ * estaba encendido, arranca; solo NO arranca si el usuario lo había dejado en OFF.
+ */
+export function wasRunningPersisted(): boolean {
+  return persisted.isRunning !== false;
+}
 
 // Evento que se dispara cuando se detecta un error crítico
 type ErrorHandler = (error: string) => void;
@@ -62,9 +94,12 @@ export function onCriticalError(handler: ErrorHandler): void {
  */
 export function startThermostat(config: Partial<ThermostatConfig> = {}): boolean {
   try {
-    // Actualizar configuración con los valores proporcionados
+    // Actualizar configuración con los valores proporcionados, preservando la
+    // config actual (sobre todo el setpoint persistido). Antes se reconstruía
+    // desde DEFAULT_CONFIG, lo que reseteaba el setpoint al apagar/prender el
+    // termostato desde HomeKit.
     thermostatConfig = {
-      ...DEFAULT_CONFIG,
+      ...thermostatConfig,
       ...config,
     };
 
@@ -78,33 +113,23 @@ export function startThermostat(config: Partial<ThermostatConfig> = {}): boolean
       // Inicializar el estado
       thermostatState.lastError = null;
       thermostatState.consecutiveErrors = 0;
-      const initialUpdateSuccess = updateCurrentState();
-      
-      if (!initialUpdateSuccess) {
-        console.warn("Advertencia: No se pudo leer la temperatura inicial, iniciando con valores predeterminados");
-      }
+      resetTPI(); // Reiniciar el controlador TPI (integral y ciclo)
+      // Lectura inicial en segundo plano: no bloqueamos el arranque por el sensor.
+      updateCurrentState().then((ok) => {
+        if (!ok) {
+          console.warn("Advertencia: No se pudo leer la temperatura inicial, iniciando con valores predeterminados");
+        }
+      });
 
       // Iniciar el intervalo para revisar la temperatura periódicamente
       thermostatInterval = setInterval(() => {
-        const stateUpdateSuccess = updateCurrentState();
-        if (stateUpdateSuccess) {
-          resetErrorCounter(); // Resetear contador de errores tras éxito
-          controlHeating();
-        } else {
-          thermostatState.consecutiveErrors++;
-          console.error(`Error consecutivo #${thermostatState.consecutiveErrors} al actualizar estado`);
-          
-          // Si hay demasiados errores consecutivos, apagar el sistema por seguridad
-          if (thermostatState.consecutiveErrors >= thermostatConfig.maxConsecutiveErrors) {
-            const errorMsg = `Demasiados errores consecutivos (${thermostatState.consecutiveErrors}), apagando termostato por seguridad`;
-            console.error(errorMsg);
-            notifyCriticalError(errorMsg);
-            stopThermostat();
-          }
-        }
+        // Si el ciclo anterior sigue leyendo el sensor, saltar este tick.
+        if (isUpdating) return;
+        runControlCycle();
       }, thermostatConfig.checkIntervalMs);
 
       thermostatState.isRunning = true;
+      persistState(); // Recordar que quedó encendido (sobrevive a reinicios/cortes)
 
       // Publicar actualización del modo via MQTT
       try {
@@ -144,6 +169,7 @@ export function stopThermostat(): boolean {
       }
 
       thermostatState.isRunning = false;
+      persistState(); // Recordar que quedó apagado (no reencender solo tras reinicio)
       console.log("Termostato detenido");
 
       // Publicar actualización del modo via MQTT
@@ -168,7 +194,7 @@ export function stopThermostat(): boolean {
 /**
  * Actualiza la temperatura objetivo
  */
-export function setTargetTemperature(temperature: number): boolean {
+export async function setTargetTemperature(temperature: number): Promise<boolean> {
   try {
     if (!validateTemperatureValue(temperature)) {
       throw new Error(`Temperatura fuera de rango válido: ${temperature}°C (debe estar entre 5-30°C)`);
@@ -177,18 +203,21 @@ export function setTargetTemperature(temperature: number): boolean {
     thermostatState.targetTemperature = temperature;
     console.log(`Temperatura objetivo actualizada a: ${temperature}°C`);
 
-    if (thermostatState.isRunning) {
-      updateCurrentState();
-      controlHeating();
+    // Persistir el nuevo setpoint a disco para que sobreviva a reinicios y
+    // cortes de luz (fire-and-forget: un fallo de E/S no debe romper el control).
+    persistState();
+
+    // Recalcular el relé de inmediato con el nuevo setpoint, pero solo si no hay
+    // un ciclo de control en vuelo: así no se solapan dos lecturas/escrituras.
+    // Si hay uno corriendo, ya tomará el nuevo setpoint (controlHeating lee la
+    // config actualizada) o lo hará el próximo tick (≤3 s).
+    if (thermostatState.isRunning && !isUpdating) {
+      await runControlCycle();
     }
 
-    // Publicar actualización del setpoint via MQTT
-    try {
-      publishSetpointUpdate(temperature);
-    } catch (error) {
-      console.warn('Error al publicar actualización de setpoint via MQTT:', error);
-      // No fallar la operación principal por un error MQTT
-    }
+    // No se re-publica el setpoint acá a propósito: el eco inmediato causaba el
+    // "rebote" del display en HomeKit al cambiar el setpoint (ver mqtt.ts,
+    // handleSetpointCommand). El publish periódico reafirma el valor actual.
 
     return true;
   } catch (error) {
@@ -200,7 +229,7 @@ export function setTargetTemperature(temperature: number): boolean {
 }
 
 /**
- * Devuelve la temperatura objetivo obtenida desde la base de datos
+ * Devuelve la temperatura objetivo actual (en memoria).
  */
 export function getTargetTemperature(): number {
   return thermostatConfig.targetTemperature;
@@ -278,6 +307,31 @@ export function resetThermostat(): boolean {
   return true;
 }
 
+// Monitor de temperatura para display: mantiene `currentTemperature` fresca
+// incluso con el termostato APAGADO, así HomeKit/HA siguen mostrando la
+// temperatura del ambiente (si no, al arrancar en OFF quedaría en 0°C). Cuando
+// el termostato está encendido, el loop de control ya lee el sensor y este
+// monitor no hace nada.
+let monitorInterval: NodeJS.Timeout | null = null;
+const MONITOR_INTERVAL_MS = 30000;
+
+export function startTemperatureMonitor(): void {
+  if (monitorInterval) return;
+  const tick = async () => {
+    if (thermostatState.isRunning) return; // el loop de control ya actualiza la temp
+    try {
+      const t = await getTemperature();
+      thermostatState.currentTemperature = Math.round(t * 1000) / 1000;
+      thermostatState.lastUpdated = new Date();
+    } catch {
+      // Lectura inválida transitoria (ej. CRC del DS18B20): ignorar, sin tocar
+      // el fail-safe (que es solo para el modo de control activo).
+    }
+  };
+  void tick(); // primera lectura inmediata para no mostrar 0°C al arrancar en OFF
+  monitorInterval = setInterval(tick, MONITOR_INTERVAL_MS);
+}
+
 // Funciones internas
 
 /**
@@ -294,61 +348,97 @@ function notifyCriticalError(errorMessage: string): void {
 }
 
 /**
- * Actualiza el estado actual leyendo la temperatura del sensor
- * @returns boolean indicando si la actualización fue exitosa
+ * Ejecuta un ciclo de control: lee el sensor y, si la lectura fue válida,
+ * decide si encender/apagar la calefacción. Protegido contra reentrancia por
+ * el flag `isUpdating` del intervalo.
  */
-function updateCurrentState(): boolean {
+async function runControlCycle(): Promise<void> {
+  isUpdating = true;
   try {
-    const temperature = getTemperature();
-    resetErrorCounter();
-    thermostatState.currentTemperature = temperature;
-    thermostatState.isHeating = getRelayState();
-    thermostatState.lastUpdated = new Date();
-    return true;
-  } catch (error) {
-    handleSensorError(toError(error));
-    return false;
+    const ok = await updateCurrentState();
+    if (ok) {
+      controlHeating();
+    }
+  } finally {
+    isUpdating = false;
   }
 }
 
 /**
- * Controla la calefacción según la temperatura y la histéresis
+ * Actualiza el estado actual combinando el sensor local DS18B20 con las fuentes
+ * externas frescas (HomePods). La temperatura efectiva es el promedio de todas
+ * las muestras válidas disponibles.
+ *
+ * Una lectura local fallida (ej. CRC inválido) no es un error si hay al menos
+ * una fuente externa fresca: el termostato sigue operando con ella. Solo cuando
+ * NO hay ninguna fuente válida se considera un error de sensor (y se activa el
+ * fail-safe tras demasiados errores consecutivos).
+ *
+ * @returns boolean indicando si se pudo determinar una temperatura válida
+ */
+async function updateCurrentState(): Promise<boolean> {
+  // Lectura local: tolera fallo si hay fuentes externas.
+  let localTemp: number | null = null;
+  try {
+    localTemp = await getTemperature();
+  } catch (error) {
+    console.warn(`[SENSOR] Lectura local DS18B20 fallida: ${toError(error).message}`);
+  }
+
+  const externalSamples = getFreshExternalSources().map((s) => s.value);
+  const samples = localTemp !== null ? [localTemp, ...externalSamples] : externalSamples;
+
+  if (samples.length === 0) {
+    handleSensorError(new Error('Sin fuentes de temperatura válidas (DS18B20 ni HomePods)'));
+    return false;
+  }
+
+  const effectiveTemp = samples.reduce((a, b) => a + b, 0) / samples.length;
+  resetErrorCounter();
+  // Recuperación del fail-safe: volvió una lectura válida tras una racha de
+  // errores. El control normal se reanuda solo (controlHeating se vuelve a
+  // ejecutar en este mismo ciclo).
+  if (failSafeActive) {
+    failSafeActive = false;
+    console.log('[SENSOR] Lecturas válidas recuperadas: se reanuda el control normal de la caldera.');
+  }
+  thermostatState.currentTemperature = Math.round(effectiveTemp * 1000) / 1000;
+  thermostatState.isHeating = getRelayState();
+  thermostatState.lastUpdated = new Date();
+  // Una actualización válida limpia el último error transitorio (ej. CRC del
+  // DS18B20) para no dejar un error fantasma colgado en el estado/UI.
+  thermostatState.lastError = null;
+  return true;
+}
+
+/**
+ * Controla la calefacción mediante el controlador TPI (time-proportional).
+ * El TPI decide encendido/apagado modulando un duty cycle según el error de
+ * temperatura; reemplaza al on/off con histéresis para mantener la temperatura
+ * mucho más estable y con un número acotado de ciclos de caldera por hora.
  */
 function controlHeating(): void {
   try {
     if (!thermostatState.isRunning) return;
-    const { targetTemperature, hysteresis } = thermostatConfig;
-    const { currentTemperature, isHeating } = thermostatState;
-    const now = Date.now();
-    const lowerLimit = targetTemperature - hysteresis;
-    const upperLimit = targetTemperature;
-    const minActionInterval = 30000;
-    if (now - lastControlAction < minActionInterval) {
-      return;
-    }
-    if (isHeating) {
-      if (currentTemperature >= upperLimit) {
-        const success = turnOffRelay();
-        if (success) {
-          thermostatState.isHeating = false;
-          lastControlAction = now;
-          console.log(`Apagando calefacción: Temperatura actual ${currentTemperature}°C alcanzó el objetivo ${upperLimit}°C`);
-        } else {
-          console.error(`Error al intentar apagar el relé a ${upperLimit}°C`);
-          thermostatState.lastError = "Error al intentar apagar la calefacción";
-        }
+    const setpoint = thermostatConfig.targetTemperature;
+    const temp = thermostatState.currentTemperature;
+    const decision = computeDesiredRelay(temp, setpoint, DEFAULT_TPI, Date.now());
+
+    if (decision.on && !thermostatState.isHeating) {
+      if (turnOnRelay()) {
+        thermostatState.isHeating = true;
+        console.log(`Caldera ON (TPI ${decision.mode}, duty ${(decision.duty * 100).toFixed(0)}%) — temp ${temp}°C / objetivo ${setpoint}°C`);
+      } else {
+        console.error('Error al intentar encender el relé');
+        thermostatState.lastError = 'Error al intentar encender la calefacción';
       }
-    } else {
-      if (currentTemperature < lowerLimit) {
-        const success = turnOnRelay();
-        if (success) {
-          thermostatState.isHeating = true;
-          lastControlAction = now;
-          console.log(`Encendiendo calefacción: Temperatura actual ${currentTemperature}°C por debajo del límite inferior ${lowerLimit}°C`);
-        } else {
-          console.error(`Error al intentar encender el relé a ${lowerLimit}°C`);
-          thermostatState.lastError = "Error al intentar encender la calefacción";
-        }
+    } else if (!decision.on && thermostatState.isHeating) {
+      if (turnOffRelay()) {
+        thermostatState.isHeating = false;
+        console.log(`Caldera OFF (TPI ${decision.mode}, duty ${(decision.duty * 100).toFixed(0)}%) — temp ${temp}°C / objetivo ${setpoint}°C`);
+      } else {
+        console.error('Error al intentar apagar el relé');
+        thermostatState.lastError = 'Error al intentar apagar la calefacción';
       }
     }
   } catch (error) {
@@ -365,14 +455,24 @@ function handleSensorError(error: Error) {
   thermostatState.consecutiveErrors++;
   thermostatState.lastError = error.message;
   console.error(`[SENSOR] Error consecutivo #${thermostatState.consecutiveErrors}: ${error.message}`);
+
   if (thermostatState.consecutiveErrors >= thermostatConfig.maxConsecutiveErrors) {
-    console.error(`[SENSOR] Se alcanzó el máximo de errores consecutivos (${thermostatConfig.maxConsecutiveErrors}). El termostato se pausará hasta que se recupere el sensor.`);
-    thermostatState.isRunning = false;
-    if (thermostatInterval) {
-      clearInterval(thermostatInterval);
-      thermostatInterval = null;
+    // Fail-safe: apagar la caldera (nunca quemar a ciegas sin lecturas
+    // confiables), pero MANTENER el termostato corriendo para seguir
+    // reintentando. Al volver una lectura válida, el control se reanuda solo
+    // (ver updateCurrentState). Antes esto detenía el termostato de forma
+    // permanente y requería intervención manual para recuperar la calefacción.
+    if (thermostatState.isHeating) {
+      turnOffRelay();
+      thermostatState.isHeating = false;
     }
-    notifyCriticalError(`Sensor error: Se pausó el termostato por demasiados errores consecutivos de sensor.`);
+
+    // Notificar una sola vez al entrar al fail-safe (no spamear en cada ciclo).
+    if (!failSafeActive) {
+      failSafeActive = true;
+      console.error(`[SENSOR] Fail-safe activado: caldera apagada por ${thermostatState.consecutiveErrors} errores consecutivos de sensor. Se sigue reintentando.`);
+      notifyCriticalError('Sensor error: se apagó la calefacción por errores consecutivos de sensor. El termostato sigue activo y reanudará al recuperar lecturas.');
+    }
   }
 }
 

@@ -1,5 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { getTemperature } from '../hardware/sensor';
+import { getTemperature, getLastTemperature } from '../hardware/sensor';
+import { recordExternalTemperature, getAllExternalSources } from '../services/temperatureSources';
+import { getTPIState } from '../services/tpiController';
 import { 
   getHysteresis,
   getTargetTemperature, 
@@ -19,19 +21,10 @@ import {
   isMqttHealthy 
 } from '../services/mqtt';
 
+// Versión única desde package.json (evita números de versión duplicados/desfasados).
+const { version: APP_VERSION } = require('../../package.json') as { version: string };
+
 const router = Router();
-
-// Cache para datos de temperatura
-let temperatureCache: {
-  value: number | null;
-  timestamp: number;
-} = {
-  value: null,
-  timestamp: 0
-};
-
-// Tiempo de expiración del caché (500 ms)
-const CACHE_TTL = 500;
 
 // Interfaces para los tipos de las solicitudes
 interface TemperatureRequest extends Request {
@@ -90,7 +83,7 @@ router.get('/health', (_req: Request, res: Response) => {
     
     res.status(200).json({
       status: 'ok',
-      version: '1.2.0',
+      version: APP_VERSION,
       uptime: process.uptime(),
       thermostatRunning: thermostatState.isRunning,
       lastError: lastError,
@@ -106,41 +99,50 @@ router.get('/health', (_req: Request, res: Response) => {
   }
 });
 
-// Ruta de temperatura con caché
-router.get('/temperature', (_req: Request, res: Response) => {
+// Ruta de temperatura. Devuelve la temperatura EFECTIVA (promedio de DS18B20 +
+// HomePods frescos) que el ciclo de control mantiene en el estado. Si el loop
+// aún no corrió (estado sin actualizar), hace una lectura local on-demand.
+router.get('/temperature', async (_req: Request, res: Response) => {
   try {
-    const now = Date.now();
-    
-    // Usar caché si está disponible y es reciente
-    if (temperatureCache.value !== null && (now - temperatureCache.timestamp) < CACHE_TTL) {
-      return res.status(200).json({ 
-        temperature: temperatureCache.value,
-        fromCache: true
-      });
+    const state = getThermostatState();
+    let temp: number | null = state.lastUpdated ? state.currentTemperature : null;
+
+    // Solo re-leer si no hay valor del loop. (Antes también re-leía con temp===0,
+    // lo que trataba 0°C real como "sin lectura".)
+    if (temp === null) {
+      temp = getLastTemperature() ?? (await getTemperature());
     }
-    
-    const temp = getTemperature();
-    if (isNaN(temp)) {
-      return res.status(500).json({ error: 'Error al obtener la temperatura del sensor' });
-    }
-    
-    // Actualizar caché
-    temperatureCache = {
-      value: temp,
-      timestamp: now
-    };
-    
+
     res.set('Cache-Control', 'private, max-age=1');
     res.status(200).json({ temperature: temp });
   } catch (error) {
     console.error('Error en endpoint /temperature:', error);
-    res.status(500).json({ error: 'Error interno al obtener la temperatura' });
+    res.status(500).json({ error: 'Error al obtener la temperatura del sensor' });
+  }
+});
+
+// Ingesta de temperatura desde fuentes externas (ej. HomePods vía Atajos de iOS).
+// Body: { id: string, value: number }  ->  el backend la promedia con el DS18B20.
+router.post('/external-temperature', (req: Request, res: Response) => {
+  try {
+    const { id, value } = req.body ?? {};
+
+    if (typeof id !== 'string' || id.trim() === '') {
+      return res.status(400).json({ error: 'Falta el campo "id" (identificador de la fuente)' });
+    }
+    if (typeof value !== 'number' || isNaN(value)) {
+      return res.status(400).json({ error: 'El campo "value" debe ser un número (°C)' });
+    }
+
+    const entry = recordExternalTemperature(id.trim(), value);
+    return res.status(200).json({ ok: true, id: entry.id, value: entry.value });
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : 'Lectura externa inválida' });
   }
 });
 
 // Estado del termostato con caché ETags
 let lastStateETag = '';
-let lastState = null;
 
 // Estado caldera
 router.get('/status', (req: Request, res: Response) => {
@@ -157,10 +159,9 @@ router.get('/status', (req: Request, res: Response) => {
       return res.status(304).end();
     }
     
-    // Actualizar ETag y estado en caché
+    // Actualizar ETag en caché
     lastStateETag = etag;
-    lastState = thermostatState;
-    
+
     // Establecer cabeceras para caching
     res.set('ETag', etag);
     res.set('Cache-Control', 'private, max-age=1');
@@ -173,7 +174,11 @@ router.get('/status', (req: Request, res: Response) => {
       isHeating: thermostatState.isHeating,
       lastUpdated: thermostatState.lastUpdated,
       isRunning: thermostatState.isRunning,
-      lastError: thermostatState.lastError
+      lastError: thermostatState.lastError,
+      // Fuentes externas de temperatura (HomePods) y su frescura, para diagnóstico.
+      externalSources: getAllExternalSources(),
+      // Estado del controlador TPI (duty cycle e integral), para diagnóstico.
+      tpi: getTPIState()
     });
   } catch (error) {
     console.error('Error en endpoint /status:', error);
@@ -182,9 +187,9 @@ router.get('/status', (req: Request, res: Response) => {
 });
 
 // Obtener temperatura objetivo
-router.get('/target-temperature', (_req: Request, res: Response) => {
+router.get('/target-temperature', async (_req: Request, res: Response) => {
   try {
-    const targetTemperature = getTargetTemperature();
+    const targetTemperature = await getTargetTemperature();
     res.set('Cache-Control', 'private, max-age=5');
     res.status(200).json({ target: targetTemperature });
   } catch (error) {
@@ -206,12 +211,12 @@ router.get('/hysteresis', (_req: Request, res: Response) => {
 });
 
 // Establecer temperatura objetivo usando middleware de validación
-router.post('/target-temperature', validateTemperature, (req: TemperatureRequest, res: Response) => {
+router.post('/target-temperature', validateTemperature, async (req: TemperatureRequest, res: Response) => {
   try {
     const { temperature } = req.body;
 
     // Ya validado por el middleware
-    const success = setTargetTemperature(temperature!);
+    const success = await setTargetTemperature(temperature!);
 
     if (!success) {
       const lastError = getLastError();
@@ -220,8 +225,7 @@ router.post('/target-temperature', validateTemperature, (req: TemperatureRequest
       });
     }
 
-    // Invalidar caché
-    temperatureCache.timestamp = 0;
+    // Invalidar caché de estado
     lastStateETag = '';
 
     res.status(200).json({ targetTemperature: temperature });
@@ -297,8 +301,7 @@ router.post('/thermostat/start', (req: ThermostatConfigRequest, res: Response) =
       });
     }
     
-    // Invalidar caché
-    temperatureCache.timestamp = 0;
+    // Invalidar caché de estado
     lastStateETag = '';
     
     res.status(200).json({ status: 'started', config });
@@ -320,8 +323,7 @@ router.post('/thermostat/stop', (_req: Request, res: Response) => {
       });
     }
     
-    // Invalidar caché
-    temperatureCache.timestamp = 0;
+    // Invalidar caché de estado
     lastStateETag = '';
     
     res.status(200).json({ status: 'stopped' });
@@ -343,8 +345,7 @@ router.post('/thermostat/reset', (_req: Request, res: Response) => {
       });
     }
     
-    // Invalidar caché
-    temperatureCache.timestamp = 0;
+    // Invalidar caché de estado
     lastStateETag = '';
     
     const state = getThermostatState();
@@ -360,7 +361,6 @@ router.post('/thermostat/reset', (_req: Request, res: Response) => {
     res.status(500).json({ error: 'Error al reiniciar el termostato' });
   }
 });
-
 
 // === Rutas para gestión MQTT ===
 

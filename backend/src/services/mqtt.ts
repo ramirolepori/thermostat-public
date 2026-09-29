@@ -1,6 +1,6 @@
 import mqtt, { MqttClient, IClientOptions } from 'mqtt';
 import { getThermostatState, setTargetTemperature } from './logic';
-import { getRelayState, turnOnRelay, turnOffRelay } from '../hardware/relay';
+import { getRelayState } from '../hardware/relay';
 
 // Configuración MQTT
 interface MqttConfig {
@@ -15,7 +15,6 @@ interface MqttConfig {
     mode: string;
     // Topics de comando (suscripción)
     setpointSet: string;
-    relaySet: string;
     modeSet: string;
   };
   publishInterval: number; // Intervalo de publicación en ms
@@ -34,7 +33,6 @@ const DEFAULT_MQTT_CONFIG: MqttConfig = {
     online: 'termostato/status/online',
     mode: 'termostato/status/mode',
     setpointSet: 'termostato/setpoint/set',
-    relaySet: 'termostato/relay/set',
     modeSet: 'termostato/mode/set'
   },
   publishInterval: 10000, // Publicar cada 10 segundos
@@ -68,11 +66,6 @@ let serviceState: MqttServiceState = {
 // Tipos para los payloads JSON
 interface TemperaturePayload {
   value: number;
-  timestamp?: string;
-}
-
-interface RelayPayload {
-  value: boolean;
   timestamp?: string;
 }
 
@@ -198,45 +191,16 @@ async function handleSetpointCommand(message: Buffer): Promise<void> {
     const success = await setTargetTemperature(value);
     if (success) {
       console.log(`✅ Setpoint actualizado via MQTT: ${value}°C`);
-      // Publicar inmediatamente el nuevo setpoint
-      publishMessage(mqttConfig.topics.setpoint, { value });
+      // NO re-publicar el setpoint acá: HA ya muestra el valor que ordenó. Al
+      // arrastrar el setpoint en HomeKit llegan varias órdenes seguidas
+      // (17,5/18/…/20) y, si las eco-publicábamos, los ecos llegaban
+      // desordenados (20→19,5→20) y el display "rebotaba". El publish periódico
+      // (cada 10s) ya reafirma el valor actual sin valores intermedios viejos.
     } else {
       console.error(`❌ Error al actualizar setpoint via MQTT: ${value}°C`);
     }
   } catch (error) {
     console.error('Error al procesar comando de setpoint via MQTT:', error);
-  }
-}
-
-/**
- * Maneja comandos recibidos para controlar el relé
- */
-async function handleRelayCommand(message: Buffer): Promise<void> {
-  const payload = parseJsonPayload<RelayPayload>(message, ['value']);
-  if (!payload) return;
-
-  const { value } = payload;
-
-  if (typeof value !== 'boolean') {
-    console.error('Valor de relé inválido recibido via MQTT:', value);
-    return;
-  }
-
-  console.log(`📥 Comando MQTT recibido: ${value ? 'encender' : 'apagar'} relé`);
-
-  try {
-    if (value) {
-      await turnOnRelay();
-      console.log('✅ Relé encendido via MQTT');
-    } else {
-      await turnOffRelay();
-      console.log('✅ Relé apagado via MQTT');
-    }
-
-    // Publicar inmediatamente el nuevo estado del relé
-    publishMessage(mqttConfig.topics.relay, { value });
-  } catch (error) {
-    console.error('Error al procesar comando de relé via MQTT:', error);
   }
 }
 
@@ -291,7 +255,6 @@ function setupSubscriptions(): void {
 
   const subscriptionTopics = [
     mqttConfig.topics.setpointSet,
-    mqttConfig.topics.relaySet,
     mqttConfig.topics.modeSet
   ];
 
@@ -314,9 +277,6 @@ function setupSubscriptions(): void {
       switch (topic) {
         case mqttConfig.topics.setpointSet:
           await handleSetpointCommand(message);
-          break;
-        case mqttConfig.topics.relaySet:
-          await handleRelayCommand(message);
           break;
         case mqttConfig.topics.modeSet:
           await handleModeCommand(message);
