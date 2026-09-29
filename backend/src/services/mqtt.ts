@@ -308,6 +308,9 @@ export function initializeMqtt(config?: Partial<MqttConfig>): void {
     clean: true,
     reconnectPeriod: mqttConfig.reconnectPeriod,
     connectTimeout: mqttConfig.connectTimeout,
+    // Credenciales opcionales: si el broker exige usuario y clave, se leen del entorno.
+    username: process.env.MQTT_USERNAME || undefined,
+    password: process.env.MQTT_PASSWORD || undefined,
     will: {
       topic: mqttConfig.topics.online,
       payload: JSON.stringify({ value: false, timestamp: new Date().toISOString() }),

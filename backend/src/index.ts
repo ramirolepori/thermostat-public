@@ -2,7 +2,6 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import express from 'express';
-import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import routes from './routes/routes';
@@ -35,9 +34,7 @@ function getLocalIP(): string {
 }
 
 // Aplicar middleware de seguridad básica (solo en producción)
-if (isProd) {
-  app.use(helmet());
-}
+app.use(helmet());
 
 // Middleware para comprimir respuestas
 app.use(compression());
@@ -45,12 +42,7 @@ app.use(compression());
 // Configurar CORS. La API solo escucha en localhost, así que CORS es marginal;
 // se deja permisivo pero SIN credentials (origin '*' + credentials:true es una
 // combinación inválida que los navegadores rechazan).
-app.use(cors({
-  origin: '*', // Permitir solicitudes desde cualquier origen
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  maxAge: 86400 // Cachear preflight requests por 24 horas
-}));
+// La API escucha solo en localhost y no tiene frontend: no se habilita CORS.
 
 // Parsear JSON con límite para evitar ataques de payload grandes
 app.use(express.json({ limit: '100kb' }));

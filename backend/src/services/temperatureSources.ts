@@ -16,6 +16,10 @@ const FRESHNESS_MS = 15 * 60 * 1000; // 15 minutos
 const MIN_VALID_TEMP = 0;
 const MAX_VALID_TEMP = 50;
 
+// Límites para que un cliente no pueda hacer crecer el mapa sin control.
+const MAX_ID_LENGTH = 64;
+const MAX_SOURCES = 20;
+
 interface ExternalSource {
   id: string;
   value: number;        // °C
@@ -31,6 +35,12 @@ const sources = new Map<string, ExternalSource>();
 export function recordExternalTemperature(id: string, value: number): ExternalSource {
   if (typeof value !== 'number' || isNaN(value) || value < MIN_VALID_TEMP || value > MAX_VALID_TEMP) {
     throw new Error(`Temperatura externa inválida o fuera de rango: ${value}°C`);
+  }
+  if (id.length > MAX_ID_LENGTH) {
+    throw new Error(`El id de la fuente supera ${MAX_ID_LENGTH} caracteres`);
+  }
+  if (!sources.has(id) && sources.size >= MAX_SOURCES) {
+    throw new Error(`Se alcanzó el máximo de ${MAX_SOURCES} fuentes externas`);
   }
   const entry: ExternalSource = { id, value, updatedAt: Date.now() };
   sources.set(id, entry);
